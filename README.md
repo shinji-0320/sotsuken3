@@ -1,8 +1,10 @@
-simple-flooding-kansei.ccは、既存のgeogridを作成したコードです。
+simple-flooding-kansei.ccは、既存のgeogridを作成したコード
 
-simple-flooding-NCN.ccは、既存のgeogridにForwarding zoneの拡張機能(送信ノード周り)を追加したものです。
+simple-flooding-NCN.ccは、既存のgeogridにForwarding zoneの拡張機能(送信ノード周り)を追加したもの
 
 simple-flooding-BCL-zentaiは、simple-flooding-NCN.ccにゲートウェイノードの転送制限機能を追加したもの(Geocast region周りはまだ)
+
+simple-flooding-BCL-rinsetsuは、simple-flooding-BCL-zentaiにGeocast region周りにの転送制限機能を追加したもの
 
 
 
