@@ -172,20 +172,20 @@
 
       実験規模・時間
       
-      nNodes, stopTime, interval
+      　nNodes, stopTime, interval
       
       送信ノード
       
-      nSources, srcId, srcCoordsStr（「x:y,x:y,…」）
+     　 nSources, srcId, srcCoordsStr（「x:y,x:y,…」）
       
-      Geocast
+     　 Geocast
       
-      useGeocast, grXmin, grYmin, grXmax, grYmax
+     　 useGeocast, grXmin, grYmin, grXmax, grYmax
       
-      Add-FWD / BCL
+      　Add-FWD / BCL
       
-      NCN, BCL
+     　 NCN, BCL
 
-非送信ノードの配置
-
-nodeCount, nodeXmin, nodeYmin, nodeXmax, nodeYmax
+      非送信ノードの配置
+      
+     　 nodeCount, nodeXmin, nodeYmin, nodeXmax, nodeYmax
