@@ -170,7 +170,7 @@ public:
                      MakeUintegerAccessor (&SimpleFloodingApp::m_ncn),
                      MakeUintegerChecker<uint32_t> ())
       // ★ BCL: ゲートウェイ転送上限（0なら無制限）
-      .AddAttribute ("BCL", "Forward limit per gateway for each (src,seq). 0=unlimited.",
+      .AddAttribute ("BCL", "Forward limit per gateway for each seq. 0=unlimited.",
                      UintegerValue (0),
                      MakeUintegerAccessor (&SimpleFloodingApp::m_bcl),
                      MakeUintegerChecker<uint32_t> ());
@@ -200,6 +200,25 @@ public:
     s_gridDefined = true;
     NS_LOG_UNCOND ("GRID-DEF: origin=(" << originX << "," << originY << ") d=" << d
                     << " Nx=" << nx << " Ny=" << ny << " total=" << (nx*ny));
+  }
+
+  // ★ 送信元IPから送信元ノードの所属g_idを引く（直送判定で使用）
+  static bool FindSenderGidByIp (Ipv4Address ip, uint32_t& outGid)
+  {
+    for (const auto& nd : s_senders) {
+      if (!nd) continue;
+      Ptr<Ipv4> ipv4 = nd->GetObject<Ipv4>();
+      if (!ipv4) continue;
+      // 本サンプルでは ifIndex=1 の0番目アドレスを使用
+      Ipv4InterfaceAddress if0 = ipv4->GetAddress (1, 0);
+      if (if0.GetLocal () == ip) {
+        Ptr<MobilityModel> mm = nd->GetObject<MobilityModel>();
+        if (!mm) return false;
+        outGid = LocateGid (mm->GetPosition ());
+        return true;
+      }
+    }
+    return false;
   }
 
 private:
@@ -753,10 +772,14 @@ private:
       if (p->GetSize () < hdr.GetSerializedSize()) continue;
       p->PeekHeader (hdr);
 
-      // (src,seq,type)で重複排除
+      // (src,seq,type) キー（DATAは毒防止のためここではまだ挿入しない）
       uint64_t key_seen = (static_cast<uint64_t>(hdr.GetSrc().Get()) << 32)
                    | (static_cast<uint64_t>(hdr.GetSeq()) ^ (static_cast<uint64_t>(hdr.GetType()) << 24));
-      if (!m_seen.insert (key_seen).second) continue;
+
+      // ★ DATA以外はここで重複排除（DATAは後段の直送判定の結果次第で挿入する）
+      if (hdr.GetType() != GeoHeader::DATA) {
+        if (!m_seen.insert (key_seen).second) continue;
+      }
 
       switch (hdr.GetType()) {
       case GeoHeader::SELECT: {
@@ -839,8 +862,39 @@ private:
               break; // 7-2
             }
           }
-          // ★ 7-3 は m_seen による重複排除で既に実施済み
-          // ★ 7-4: 自身が Geocast region 内なら転送しない（到達とみなす）
+
+          // ★ 7-3相当（DATA）：直送判定のため、m_seen の挿入はこの後で実施する
+
+          // ★ 直送/非直送で挙動を分岐（7-3と7-4の間に追加）
+          const bool directFromSrc = (prevHop == hdr.GetSrc());
+          if (directFromSrc) {
+            // ★送信元からの「直送」：送信元と同じグリッドにいる場合のみ転送
+            uint32_t sgid = 0;
+            if (!FindSenderGidByIp(hdr.GetSrc(), sgid)) {
+              NS_LOG_UNCOND ("[" << Simulator::Now ().GetSeconds () << "s] "
+                              << m_myAddress << " DROP cannot-resolve-src-grid");
+              // ★ここでは m_seen に入れない → 後で他GWから届けば一度だけ転送できる
+              break;
+            }
+            if (sgid != m_g_id) {
+              NS_LOG_UNCOND ("[" << Simulator::Now ().GetSeconds () << "s] "
+                              << m_myAddress << " DROP src-different-grid"
+                              << " sgid=" << sgid << " my_gid=" << m_g_id);
+              // ★ここでは m_seen に入れない → 後で他GWから届けば一度だけ転送できる
+              break;
+            }
+            // ★同一グリッド → この時点で初回のみ受理（重複ならDROP）
+            if (!m_seen.insert (key_seen).second) {
+              break; // 7-3（重複）
+            }
+          } else {
+            // ★他GWからの転送：従来どおり「一度だけ」転送
+            if (!m_seen.insert (key_seen).second) {
+              break; // 7-3（重複）
+            }
+          }
+
+          // 7-4: 自身が Geocast region 内なら転送しない（到達とみなす）
           if (s_useGeocast) {
             Ptr<MobilityModel> mm = GetNode()->GetObject<MobilityModel>();
             if (mm) {
@@ -853,23 +907,23 @@ private:
               }
             }
           }
-          // ★ 7-5: BCL（転送上限）— ゲートウェイが同一 (src,seq) を転送できる回数を制限
-          // キーは (seq) で作成し、m_bcl==0 のときは無制限
+
+          // 7-5: BCL（転送上限）— ゲートウェイが同一 seq を転送できる回数を制限（0=無制限）
           {
-             const uint32_t key_bcl = hdr.GetSeq();  // ★ 修正：送信元に関わらず seq だけでキー化
+            const uint32_t key_bcl = hdr.GetSeq();  // ★ seqのみでキー化
+            if (m_bcl > 0) {
+              uint32_t &cnt = m_bclCount[key_bcl];
+              if (cnt >= m_bcl) {
+                NS_LOG_UNCOND ("[" << Simulator::Now ().GetSeconds () << "s] "
+                                  << m_myAddress << " DROP BCL-limit seq=" << hdr.GetSeq()
+                                  << " limit=" << m_bcl);
+                break;
+              }
+              ++cnt; // 転送予定として先にカウント
+            }
+          }
 
-             if (m_bcl > 0) {
-               uint32_t &cnt = m_bclCount[key_bcl];
-               if (cnt >= m_bcl) {
-                 NS_LOG_UNCOND ("[" << Simulator::Now ().GetSeconds () << "s] "
-                                   << m_myAddress << " DROP BCL-limit seq=" << hdr.GetSeq()
-                                   << " limit=" << m_bcl);
-                 break;
-               }
-               ++cnt; // 転送予定として先にカウント
-             }
-           }
-
+          // 7-6: 転送（ブロードキャスト）
           static Ptr<UniformRandomVariable> uv = CreateObject<UniformRandomVariable>();
           double jitter = uv->GetValue (0.0, 0.006);
           Ptr<Packet> cp = p->Copy();
@@ -1051,7 +1105,7 @@ int main (int argc, char *argv[])
   cmd.AddValue ("nodeYmax",  "Random placement Ymax", nodeYmax);
   
   cmd.AddValue ("NCN",       "Number of coded packets (controls Add-Forwarding zone)", NCN); // Add-Forwarding: 受け取り
-  cmd.AddValue ("BCL",       "Forward limit per gateway for each (src,seq). 0=unlimited", BCL); // ★ BCL: CLI受け取り
+  cmd.AddValue ("BCL",       "Forward limit per gateway for each seq. 0=unlimited", BCL); // ★ BCL: CLI受け取り
 
   cmd.Parse (argc, argv);
 
@@ -1079,9 +1133,9 @@ int main (int argc, char *argv[])
   // --- Wi-Fi（802.11b） ---
   WifiHelper wifi; wifi.SetStandard (WIFI_STANDARD_80211b);
   YansWifiPhyHelper phy;
-  // 送信電力を単一値に固定（約25.45 dBm）
-  phy.Set ("TxPowerStart", DoubleValue (25.45));
-  phy.Set ("TxPowerEnd",   DoubleValue (25.45));
+  // 送信電力を単一値に固定（約24.45 dBm）
+  phy.Set ("TxPowerStart", DoubleValue (24.45));
+  phy.Set ("TxPowerEnd",   DoubleValue (24.45));
   phy.Set ("TxPowerLevels", UintegerValue (1));
   phy.Set ("TxGain", DoubleValue (0.0));
   phy.Set ("RxGain", DoubleValue (0.0));
@@ -1106,6 +1160,7 @@ int main (int argc, char *argv[])
     mobSrc.Install (srcNodes);
   }
   
+   /*
   // --- 非送信ノード：RandomWaypoint（矩形内を移動） ---
   // ※ 速度は今は 5.0 m/s。4km/h にしたい場合は 1.111111 に変更
   {
@@ -1131,6 +1186,39 @@ int main (int argc, char *argv[])
                                "PositionAllocator", PointerValue (randAlloc));
     mobOther.Install (otherNodes);
   }
+   */
+
+  // /*
+  // --- 非送信ノード：格子状に固定配置（デバッグ用） ---
+  {
+    const uint32_t N = otherNodes.GetN();
+
+    const double startX = 25.0;  // 格子の起点X
+    const double startY = 25.0;  // 格子の起点Y
+    const double pitch  = 50.0;  // x・y 共通の格子間隔（m）
+
+    // ほぼ正方に並べるための列数（必要なら固定列数にしてもOK）
+    const uint32_t cols = static_cast<uint32_t>(
+        std::ceil(std::sqrt(static_cast<double>(N)))
+    );
+
+    Ptr<ListPositionAllocator> list = CreateObject<ListPositionAllocator>();
+    for (uint32_t i = 0; i < N; ++i) {
+      const uint32_t r = i / cols;   // 行
+      const uint32_t c = i % cols;   // 列
+      const double x = startX + pitch * c; // x は +50 ずつ
+      const double y = startY + pitch * r; // y も +50 ずつ
+      list->Add(Vector(x, y, 0.0));
+    }
+
+    MobilityHelper mobOther;
+    mobOther.SetPositionAllocator(list);
+    // 移動させず固定
+    mobOther.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+    mobOther.Install(otherNodes);
+  }
+// */
+  
 
   // --- IP スタック / アドレス割当（/22） ---
   InternetStackHelper internet; internet.Install (nodes);
@@ -1192,4 +1280,3 @@ int main (int argc, char *argv[])
   Simulator::Destroy ();
   return 0;
 }
-
