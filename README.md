@@ -23,12 +23,12 @@ nodeXmin,nodeYmin,nodeXmax,nodeYmaxは、送信ノード以外のノードをラ
 
 
 NCNは、符号化パケットの作成数を表しており、今のところForwarding zoneの拡張にのみ関与
-　　　　0<=NCN<=3の時、Add-Forwarding zoneの追加はなし。元々のForwarding zoneのみ
-    　　NCN>=4の時、グリッド1個をAdd-Forwarding zoneに追加
-      　NCN>=5の時、グリッド2個をAdd-Forwarding zoneに追加
-       NCN>=6の時、グリッド3個をAdd-Forwarding zoneに追加
-       NCN>=7の時、グリッド4個をAdd-Forwarding zoneに追加
-       NCN>=8の時、グリッド5個をAdd-Forwarding zoneに追加
+    0<=NCN<=3の時、Add-Forwarding zoneの追加はなし。元々のForwarding zoneのみ
+    NCN>=4の時、グリッド1個をAdd-Forwarding zoneに追加
+    NCN>=5の時、グリッド2個をAdd-Forwarding zoneに追加
+    NCN>=6の時、グリッド3個をAdd-Forwarding zoneに追加
+    NCN>=7の時、グリッド4個をAdd-Forwarding zoneに追加
+    NCN>=8の時、グリッド5個をAdd-Forwarding zoneに追加
 
 
 BCLは、ゲートウェイノードの転送制限数を表しており、この数までしかパケットを転送しない
