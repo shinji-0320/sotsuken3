@@ -20,7 +20,7 @@
 #include <string>
 #include <algorithm>
 #include <cstdlib>
-#include <unordered_set>  // ★ 追加：共有ADD-GIDsで使用
+#include <unordered_set>
 
 using namespace ns3;
 // ======================= アプリ層ヘッダ ===========================
@@ -283,40 +283,84 @@ private:
     s_addZoneGids.clear(); // まず空にする // Add-FWD: クリア
 
     if (s_srcGridId == 0) {
-    
       s_addFwdComputedForNCN = s_NCN;
       NS_LOG_UNCOND ("ADD-FWD recompute skipped: srcGridId=0 (NCN=" << s_NCN << ")");
       return; 
-    
     }
 
-    auto addIfValid = [&](int gid) {
-      if (gid >= 1 && gid <= static_cast<int>(s_gridNx * s_gridNy)) {
-        s_addZoneGids.insert(static_cast<uint32_t>(gid));
-      }
+    // 仕様変更点：
+    // 候補 = { sg+(Nx-1), sg-(Nx+1), sg-1, sg-Nx, sg-(Nx-1) } を生成し、
+    // Geocast region の中心との距離が近い順（同距離なら gid 小）に並べて、
+    // NCN に応じて先頭から k 件（k = clamp(NCN-3, 0..5)）を採用する。
+    const int sg  = static_cast<int>(s_srcGridId);
+    const int Nx  = static_cast<int>(s_gridNx);
+    const int Ny  = static_cast<int>(s_gridNy);
+    const int Ntot = Nx * Ny;
+
+    auto inRange = [&](int gid)->bool {
+      return (gid >= 1 && gid <= Ntot);
     };
-    
-    // 段階追加を“しきい値テーブル”で明示 // Add-FWD: しきい値テーブル
-    struct Rule { int thr; int offset; const char* note; };
-    const int sg = static_cast<int>(s_srcGridId);
-    const int Nx = static_cast<int>(s_gridNx);
-    const Rule rules[] = {
-      {4,  + (Nx - 1), "sg+(Nx-1)"},
-      {5,  - (Nx + 1), "sg-(Nx+1)"},
-      {6,  - 1       , "sg-1"     },
-      {7,  - Nx      , "sg-Nx"    },
-      {8,  - (Nx - 1), "sg-(Nx-1)"},
+
+    // Geocast region の中心
+    const double grCx = 0.5 * (s_grXmin + s_grXmax);
+    const double grCy = 0.5 * (s_grYmin + s_grYmax);
+
+    // グリッド中心（gid:1-based）を返す補助
+    auto gridCenter = [&](int gid)->std::pair<double,double> {
+      int idx = gid - 1;
+      double cx = s_GXmin[idx] + 0.5 * s_grid_d;
+      double cy = s_GYmin[idx] + 0.5 * s_grid_d;
+      return {cx, cy};
     };
-    for (const auto& r : rules) {
-      if (static_cast<int>(s_NCN) >= r.thr) addIfValid(sg + r.offset);
+
+    // 距離^2（実距離でなく平方距離でOK。比較順は同じ）
+    auto dist2ToGR = [&](int gid)->double {
+      auto [cx, cy] = gridCenter(gid);
+      double dx = cx - grCx, dy = cy - grCy;
+      return dx*dx + dy*dy;
+    };
+
+    // 候補の生成（順序は仕様に沿っているが、後で距離で並べ替える）
+    int candRaw[5] = {
+      sg + (Nx - 1),
+      sg - (Nx + 1),
+      sg - 1,
+      sg - Nx,
+      sg - (Nx - 1)
+    };
+
+    // 有効な候補を収集し、(distance2, gid) でソート
+    std::vector<std::pair<double,int>> scored;
+    scored.reserve(5);
+    for (int i = 0; i < 5; ++i) {
+      int gid = candRaw[i];
+      if (!inRange(gid)) continue;
+      scored.emplace_back(dist2ToGR(gid), gid);
+    }
+    std::sort(scored.begin(), scored.end(),
+      [](const std::pair<double,int>& a, const std::pair<double,int>& b){
+        if (std::abs(a.first - b.first) > 1e-12) return a.first < b.first; // 距離小さい順
+        return a.second < b.second; // 同距離なら gid 小さい方
+      });
+
+    // 追加数 k = clamp(NCN-3, 0..5)
+    int k = static_cast<int>(s_NCN) - 3;
+    if (k < 0) k = 0;
+    if (k > 5) k = 5;
+    // 実際に存在する候補数にクリップ
+    if (k > static_cast<int>(scored.size())) k = static_cast<int>(scored.size());
+
+    for (int i = 0; i < k; ++i) {
+      s_addZoneGids.insert(static_cast<uint32_t>(scored[i].second));
     }
 
-    // ログ（確認用） // Add-FWD: ログ
+    // ログ（確認用）
     std::ostringstream oss; oss << "ADD-FWD GIDs = {"; bool first=true;
     for (auto g: s_addZoneGids) { if(!first) oss<<","; first=false; oss<<g; }
-    oss << "} (NCN=" << s_NCN << ", sg-id=" << s_srcGridId << ", Nx=" << s_gridNx << ")";
+    oss << "} (NCN=" << s_NCN << ", sg-id=" << s_srcGridId
+        << ", Nx=" << s_gridNx << ", rule=distance-to-GR-center)";
     NS_LOG_UNCOND (oss.str());
-    
+
     s_addFwdComputedForNCN = s_NCN;
   }
   
@@ -591,6 +635,7 @@ private:
     hdr.SetRound (m_selectRound);
     hdr.SetDistance (static_cast<float>(DistToGridCenter ()));
 
+
     Ptr<Packet> p = Create<Packet> (16);
     p->AddHeader (hdr);
     InetSocketAddress bcast (Ipv4Address ("255.255.255.255"), m_port);
@@ -702,7 +747,7 @@ private:
     Ptr<MobilityModel> mm = GetNode ()->GetObject<MobilityModel>(); if (!mm) return true;
     Vector pos = mm->GetPosition ();
 
-    // ★ 共有ゾーンが初期化済みなら N0 共有矩形で判定（全送信ノード共通）
+    // 共有ゾーンが初期化済みなら N0 共有矩形で判定（全送信ノード共通）
     if (s_zoneInit) {
       return (pos.x >= s_fwdRect.x0 && pos.x <= s_fwdRect.x1 &&
               pos.y >= s_fwdRect.y0 && pos.y <= s_fwdRect.y1);
@@ -721,7 +766,7 @@ private:
     if (!s_zoneComputed) return false;
     EnsureAddFwdComputed ();          // NCN変化時は再計算
 
-    // ★ 共有ゾーンが初期化済みなら N0 共有 ADD-GIDs を使用
+    // 共有ゾーンが初期化済みなら N0 共有 ADD-GIDs を使用
     if (s_zoneInit) {
       return (s_addFwdGids.find(m_g_id) != s_addFwdGids.end());
     }
@@ -729,6 +774,29 @@ private:
     // フォールバック：従来の追加集合
     return (s_addZoneGids.find(m_g_id) != s_addZoneGids.end());
   }
+  
+  
+  // --- ユーティリティ: 送信ノードIP→そのg_idを取得（prev==srcのときに使用） ---
+  // ※ s_senders に登録された送信ノード配列を走査してIP一致を探す
+  static bool FindSenderGidByIp (Ipv4Address ip, uint32_t& outGid)
+  {
+    for (const auto& nd : s_senders) {
+      if (!nd) continue;
+      Ptr<Ipv4> ipv4 = nd->GetObject<Ipv4>();
+      if (!ipv4) continue;
+      // 本サンプルでは ifIndex=1 の0番目アドレスを使用
+      Ipv4InterfaceAddress if0 = ipv4->GetAddress (1, 0);
+      if (if0.GetLocal () == ip) {
+        Ptr<MobilityModel> mm = nd->GetObject<MobilityModel>();
+        if (!mm) return false;
+        outGid = LocateGid (mm->GetPosition ());
+        return true;
+      }
+    }
+    return false;
+  }
+  
+  
 
   // ---------- 受信処理 ----------
   // 全メッセージを受信。前ホップIPとヘッダを見て種別ごとに処理。
@@ -749,8 +817,12 @@ private:
       // (src,seq,type)で重複排除
       uint64_t key = (static_cast<uint64_t>(hdr.GetSrc().Get()) << 32)
                    | (static_cast<uint64_t>(hdr.GetSeq()) ^ (static_cast<uint64_t>(hdr.GetType()) << 24));
-      if (!m_seen.insert (key).second) continue;
 
+      // DATA以外は従来どおり「先に」重複排除する（DATAは後段で条件に応じて登録）
+      bool isData = (hdr.GetType() == GeoHeader::DATA);
+      if (!isData) {
+        if (!m_seen.insert (key).second) continue;
+      }
       switch (hdr.GetType()) {
       case GeoHeader::SELECT: {
         // 同g_id & 非送信のみ候補取り込み
@@ -819,11 +891,11 @@ private:
                         << " prev=" << prevHop
                         << " src="  << hdr.GetSrc ()
                         << " seq="  << hdr.GetSeq ());
-          if (!m_isGateway) {
-            NS_LOG_UNCOND ("[" << Simulator::Now ().GetSeconds () << "s] "
-                            << m_myAddress << " DROP not-gateway");
-            break;
-          }
+        if (!m_isGateway) {
+          NS_LOG_UNCOND ("[" << Simulator::Now ().GetSeconds () << "s] "
+                          << m_myAddress << " DROP not-gateway");
+          break;
+        }
           // まず矩形FWDを判定、ダメならAdd-FWDも判定 // 受信: FWD→Add-FWD の順で許可
           if (!IsInsideFwdZone ()) {
             if (!IsInsideAddFwdZone ()) {
@@ -832,6 +904,29 @@ private:
               break;
             }
           }
+
+        const bool directFromSrc = (prevHop == hdr.GetSrc());
+
+        if (directFromSrc) {
+          // 送信元からの「直送」：送信元と同じグリッドにいる場合のみ転送
+          uint32_t sgid = 0;
+          if (!FindSenderGidByIp(hdr.GetSrc(), sgid)) {
+            NS_LOG_UNCOND ("[" << Simulator::Now ().GetSeconds () << "s] "
+                            << m_myAddress << " DROP cannot-resolve-src-grid");
+            break; // 送信元g_idが不明なら保守的にDROP
+          }
+          if (sgid != m_g_id) {
+            NS_LOG_UNCOND ("[" << Simulator::Now ().GetSeconds () << "s] "
+                            << m_myAddress << " DROP src-different-grid"
+                            << " sgid=" << sgid << " my_gid=" << m_g_id);
+            // ここでは m_seen に入れない → 後で他GWから届けば一度だけ転送できる
+            break;
+          }
+          // 同一グリッド → 転送許可（初回のみ）
+          if (!m_seen.insert (key).second) {
+            // 既に同一(src,seq,type)で転送済み
+            break;
+          }
           static Ptr<UniformRandomVariable> uv = CreateObject<UniformRandomVariable>();
           double jitter = uv->GetValue (0.0, 0.006);
           Ptr<Packet> cp = p->Copy();
@@ -839,12 +934,27 @@ private:
           Simulator::Schedule (Seconds (jitter), [this, cp, hdrCopy]() {
             this->Forward (cp, hdrCopy);
           });
-          break;
+        } else {
+          // 他GWからの転送：従来どおり「一度だけ」転送
+          if (!m_seen.insert (key).second) {
+            // すでに自分が一度処理した(DATA) → 何もしない
+            break;
+          }
+          static Ptr<UniformRandomVariable> uv = CreateObject<UniformRandomVariable>();
+          double jitter = uv->GetValue (0.0, 0.006);
+          Ptr<Packet> cp = p->Copy();
+          GeoHeader hdrCopy = hdr;
+          Simulator::Schedule (Seconds (jitter), [this, cp, hdrCopy]() {
+            this->Forward (cp, hdrCopy);
+          });
         }
-        default: break;
+        break;
+      }
+      default: break;
       }
     }
   }
+
 
 private:
   // --- インスタンス状態 ---
@@ -1035,9 +1145,9 @@ int main (int argc, char *argv[])
   // --- Wi-Fi（802.11b） ---
   WifiHelper wifi; wifi.SetStandard (WIFI_STANDARD_80211b);
   YansWifiPhyHelper phy;
-  // 送信電力を単一値に固定（約25.45 dBm）
-  phy.Set ("TxPowerStart", DoubleValue (25.45));
-  phy.Set ("TxPowerEnd",   DoubleValue (25.45));
+  // 送信電力を単一値に固定（約24.45 dBm）
+  phy.Set ("TxPowerStart", DoubleValue (24.45));
+  phy.Set ("TxPowerEnd",   DoubleValue (24.45));
   phy.Set ("TxPowerLevels", UintegerValue (1));
   phy.Set ("TxGain", DoubleValue (0.0));
   phy.Set ("RxGain", DoubleValue (0.0));
@@ -1061,7 +1171,8 @@ int main (int argc, char *argv[])
     mobSrc.SetMobilityModel ("ns3::ConstantPositionMobilityModel");
     mobSrc.Install (srcNodes);
   }
-  
+ 
+  /*
   // --- 非送信ノード：RandomWaypoint（矩形内を移動） ---
   // ※ 速度は今は 5.0 m/s。4km/h にしたい場合は 1.111111 に変更
   {
@@ -1087,6 +1198,40 @@ int main (int argc, char *argv[])
                                "PositionAllocator", PointerValue (randAlloc));
     mobOther.Install (otherNodes);
   }
+  */
+  
+  
+   //  /*
+    // --- 非送信ノード：格子状に固定配置（デバッグ用） ---
+  {
+    const uint32_t N = otherNodes.GetN();
+
+    const double startX = -25.0;  // 格子の起点X
+    const double startY = -25.0;  // 格子の起点Y
+    const double pitch  = 50.0;  // x・y 共通の格子間隔（m）
+
+    // ほぼ正方に並べるための列数（必要なら固定列数にしてもOK）
+    const uint32_t cols = static_cast<uint32_t>(
+        std::ceil(std::sqrt(static_cast<double>(N)))
+    );
+
+    Ptr<ListPositionAllocator> list = CreateObject<ListPositionAllocator>();
+    for (uint32_t i = 0; i < N; ++i) {
+      const uint32_t r = i / cols;   // 行
+      const uint32_t c = i % cols;   // 列
+      const double x = startX + pitch * c; // x は +50 ずつ
+      const double y = startY + pitch * r; // y も +50 ずつ
+      list->Add(Vector(x, y, 0.0));
+    }
+
+    MobilityHelper mobOther;
+    mobOther.SetPositionAllocator(list);
+    // 移動させず固定
+    mobOther.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+    mobOther.Install(otherNodes);
+  }
+ // */
+  
 
   // --- IP スタック / アドレス割当（/22） ---
   InternetStackHelper internet; internet.Install (nodes);
@@ -1146,4 +1291,3 @@ int main (int argc, char *argv[])
   Simulator::Destroy ();
   return 0;
 }
-

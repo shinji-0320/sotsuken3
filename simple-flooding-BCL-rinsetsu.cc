@@ -12,6 +12,7 @@
 #include "ns3/wifi-module.h"
 #include "ns3/netanim-module.h"
 #include <set>
+#include <limits>
 #include <map>
 #include <sstream>
 #include <cmath>
@@ -19,9 +20,9 @@
 #include <string>
 #include <algorithm>
 #include <cstdlib>
+#include <unordered_set>
 
 using namespace ns3;
-
 // ======================= アプリ層ヘッダ ===========================
 // GeoGRID 用の自前ヘッダ。メッセージ種別と選出情報/位置情報を24B固定で運ぶ。
 class GeoHeader : public Header
@@ -161,7 +162,18 @@ public:
       .AddAttribute ("S_id", "Source id (1-based) used to anchor the forwarding zone.",
                      UintegerValue (1),
                      MakeUintegerAccessor (&SimpleFloodingApp::m_s_id),
+                     MakeUintegerChecker<uint32_t> ())
+      // NCN: 符号化パケット作成数（Add-Forwarding zone制御用）
+      .AddAttribute ("NCN", "Number of coded packets (controls Add-Forwarding zone).",
+                     UintegerValue (0),
+                     MakeUintegerAccessor (&SimpleFloodingApp::m_ncn),
+                     MakeUintegerChecker<uint32_t> ())
+      // BCL: ゲートウェイノードの転送制限数（0なら制限なし）
+      .AddAttribute ("BCL", "Forwarding limit per gateway node (0 = no limit).",
+                     UintegerValue (0),
+                     MakeUintegerAccessor (&SimpleFloodingApp::m_bcl),
                      MakeUintegerChecker<uint32_t> ());
+    
     return tid;
   }
 
@@ -192,26 +204,173 @@ public:
 
 private:
   // ---------- Forwarding zone 算出 ----------
-  // Geocast region と送信ノード(S_id)の位置から一度だけ矩形を作る。
+  // Geocast region と「送信ノードの所属グリッド」の境界から一度だけ矩形を作る 
   static void MaybeComputeZone ()
   {
     if (!s_useGeocast || s_zoneComputed) return;
+    // Add-FWD の計算もここで一度だけ行う（NCNに依存）
+    
     if (s_s_id == 0) return;
     uint32_t idx = s_s_id - 1;
     if (idx >= s_senders.size ()) return;
     Ptr<Node> anchor = s_senders[idx]; if (!anchor) return;
     Ptr<MobilityModel> mm = anchor->GetObject<MobilityModel>(); if (!mm) return;
     Vector spos = mm->GetPosition ();
-    double Xs = spos.x, Ys = spos.y;
 
-    // 送信ノード座標と Geocast 矩形から FWD ゾーンを定義
-    if (s_grXmax >= Xs) { s_rXmin = Xs; s_rXmax = s_grXmax; } else { s_rXmin = s_grXmax; s_rXmax = Xs; }
-    if (s_grYmax >= Ys) { s_rYmin = Ys; s_rYmax = s_grYmax; } else { s_rYmin = s_grYmax; s_rYmax = Ys; }
-    s_zoneComputed = true;
+    // 送信ノードの所属グリッドを求め、そのセル境界を取得
+    uint32_t sgid = LocateGid (spos);
+    s_srcGridId = sgid; // Add-Forwarding: 送信元グリッド保持
+    if (sgid == 0) return;
+   
+    double gxmin = s_GXmin[sgid - 1], gxmax = s_GXmax[sgid - 1];
+    double gymin = s_GYmin[sgid - 1], gymax = s_GYmax[sgid - 1];
+
+     
+    // X方向: grXmin と グリッドXmin を比較
+    //   grXmin >= GXmin → rXmin=GXmin, rXmax=grXmax
+    //   grXmin <  GXmin → rXmin=grXmin, rXmax=GXmax
+    if (s_grXmin >= gxmin) { s_rXmin = gxmin; s_rXmax = s_grXmax; }
+    else                    { s_rXmin = s_grXmin; s_rXmax = gxmax; }
+
+    // Y方向: grYmin と グリッドYmin を比較
+    //   grYmin >= GYmin → rYmin=GYmin, rYmax=grYmax
+    //   grYmin <  GYmin → rYmin=grYmin, rYmax=GYmax
+    if (s_grYmin >= gymin) { s_rYmin = gymin; s_rYmax = s_grYmax; }
+    else                    { s_rYmin = s_grYmin; s_rYmax = gymax; }
+
+    
     NS_LOG_UNCOND ("FWD-ZONE(app): [" << s_rXmin << "," << s_rYmin << "] - [" << s_rXmax << "," << s_rYmax
                     << "]  by s-id=" << s_s_id << "  (GR=[" << s_grXmin << "," << s_grYmin
-                    << "]-[" << s_grXmax << "," << s_grYmax << "])");
+                    << "]-[" << s_grXmax << "," << s_grYmax << "]"
+                    << " , SRC-GRID=[" << gxmin << "," << gymin << "]-[" << gxmax << "," << gymax << "])");
+
+    // Add-FWD の初期計算（ゾーン確定時点で一度実施） // Add-FWD: 初回算出
+    ComputeAddFwdZone ();
+    
+    
+    if (!s_addZoneGids.empty()) {
+      std::ostringstream oss;
+      oss << "ADD-FWD GIDs = {";
+      bool first=true;
+      for (auto g: s_addZoneGids) { if(!first) oss<<","; first=false; oss<<g; }
+      oss << "}";
+      NS_LOG_UNCOND (oss.str());
+    } else {
+      NS_LOG_UNCOND ("ADD-FWD GIDs = {} (NCN=" << s_NCN << ")");
+    }
+    
+    s_zoneComputed = true; // Add-Forwarding: 追加ゾーン算出後に確定
+
+    // ★ 共有ゾーンへ N0 で確定した値をコピー（以後は全送信ノードで共有）
+    s_fwdRect = { s_rXmin, s_rYmin, s_rXmax, s_rYmax };
+    s_addFwdGids.clear();
+    for (auto g : s_addZoneGids) s_addFwdGids.insert(g);
+    s_zoneInit = true;
   }
+  
+  
+   // ---------- Add-FWD 再計算制御 ----------
+  static void EnsureAddFwdComputed ()
+  {
+    // NCNが変わっていたら再計算 // Add-FWD: 版管理
+    if (s_addFwdComputedForNCN != s_NCN) {
+      ComputeAddFwdZone ();
+      // ★ 再計算に伴い共有ADD-GIDsも更新（矩形は不変）
+      if (s_zoneComputed) {
+        s_addFwdGids.clear();
+        for (auto g : s_addZoneGids) s_addFwdGids.insert(g);
+        s_zoneInit = true;
+      }
+    }
+  }
+
+  // ---------- Add-FWD 集合の再計算本体 ----------
+  static void ComputeAddFwdZone ()
+  {
+    s_addZoneGids.clear(); // まず空にする // Add-FWD: クリア
+
+    if (s_srcGridId == 0) {
+      s_addFwdComputedForNCN = s_NCN;
+      NS_LOG_UNCOND ("ADD-FWD recompute skipped: srcGridId=0 (NCN=" << s_NCN << ")");
+      return; 
+    }
+
+    // 仕様変更点：
+    // 候補 = { sg+(Nx-1), sg-(Nx+1), sg-1, sg-Nx, sg-(Nx-1) } を生成し、
+    // Geocast region の中心との距離が近い順（同距離なら gid 小）に並べて、
+    // NCN に応じて先頭から k 件（k = clamp(NCN-3, 0..5)）を採用する。
+    const int sg  = static_cast<int>(s_srcGridId);
+    const int Nx  = static_cast<int>(s_gridNx);
+    const int Ny  = static_cast<int>(s_gridNy);
+    const int Ntot = Nx * Ny;
+
+    auto inRange = [&](int gid)->bool {
+      return (gid >= 1 && gid <= Ntot);
+    };
+
+    // Geocast region の中心
+    const double grCx = 0.5 * (s_grXmin + s_grXmax);
+    const double grCy = 0.5 * (s_grYmin + s_grYmax);
+
+    // グリッド中心（gid:1-based）を返す補助
+    auto gridCenter = [&](int gid)->std::pair<double,double> {
+      int idx = gid - 1;
+      double cx = s_GXmin[idx] + 0.5 * s_grid_d;
+      double cy = s_GYmin[idx] + 0.5 * s_grid_d;
+      return {cx, cy};
+    };
+
+    // 距離^2（実距離でなく平方距離でOK。比較順は同じ）
+    auto dist2ToGR = [&](int gid)->double {
+      auto [cx, cy] = gridCenter(gid);
+      double dx = cx - grCx, dy = cy - grCy;
+      return dx*dx + dy*dy;
+    };
+
+    // 候補の生成（順序は仕様に沿っているが、後で距離で並べ替える）
+    int candRaw[5] = {
+      sg + (Nx - 1),
+      sg - (Nx + 1),
+      sg - 1,
+      sg - Nx,
+      sg - (Nx - 1)
+    };
+
+    // 有効な候補を収集し、(distance2, gid) でソート
+    std::vector<std::pair<double,int>> scored;
+    scored.reserve(5);
+    for (int i = 0; i < 5; ++i) {
+      int gid = candRaw[i];
+      if (!inRange(gid)) continue;
+      scored.emplace_back(dist2ToGR(gid), gid);
+    }
+    std::sort(scored.begin(), scored.end(),
+      [](const std::pair<double,int>& a, const std::pair<double,int>& b){
+        if (std::abs(a.first - b.first) > 1e-12) return a.first < b.first; // 距離小さい順
+        return a.second < b.second; // 同距離なら gid 小さい方
+      });
+
+    // 追加数 k = clamp(NCN-3, 0..5)
+    int k = static_cast<int>(s_NCN) - 3;
+    if (k < 0) k = 0;
+    if (k > 5) k = 5;
+    // 実際に存在する候補数にクリップ
+    if (k > static_cast<int>(scored.size())) k = static_cast<int>(scored.size());
+
+    for (int i = 0; i < k; ++i) {
+      s_addZoneGids.insert(static_cast<uint32_t>(scored[i].second));
+    }
+
+    // ログ（確認用）
+    std::ostringstream oss; oss << "ADD-FWD GIDs = {"; bool first=true;
+    for (auto g: s_addZoneGids) { if(!first) oss<<","; first=false; oss<<g; }
+    oss << "} (NCN=" << s_NCN << ", sg-id=" << s_srcGridId
+        << ", Nx=" << s_gridNx << ", rule=distance-to-GR-center)";
+    NS_LOG_UNCOND (oss.str());
+
+    s_addFwdComputedForNCN = s_NCN;
+  }
+  
 
   // ---------- 位置→g_id（1始まり） ----------
   // 座標から所属グリッドIDを取得（外れ値は端にクリップ）
@@ -395,7 +554,13 @@ private:
     s_useGeocast = m_useGeocastAttr;
     s_grXmin = m_grXmin; s_grYmin = m_grYmin; s_grXmax = m_grXmax; s_grYmax = m_grYmax;
     s_s_id = m_s_id;
-
+    s_NCN = m_ncn; // Add-Forwarding: NCNを共有へ反映
+    NS_LOG_UNCOND ("[StartApplication] node=" << GetNode()->GetId()
+                   << " m_ncn=" << m_ncn << " -> s_NCN=" << s_NCN
+                   << " BCL=" << m_bcl); // Add-FWD + BCL: 起動時ログ
+    
+    s_addZoneGids.clear(); // Add-Forwarding: 起動時に追加ゾーン集合を一度クリア
+    
     // Sender 登録（FWDゾーンの基準座標を引くため）
     if (m_isSender && m_senderIndex > 0) {
       if (s_senders.size () < m_senderIndex) s_senders.resize (m_senderIndex);
@@ -443,7 +608,7 @@ private:
       Simulator::Schedule (Seconds (j), &SimpleFloodingApp::SendSelect, this);
     }
 
-    // 送信ノードは小さなジッタを入れて送信開始（衝突回避）
+    // 送信ノードは即時送信開始
     if (m_isSender) {
       static Ptr<UniformRandomVariable> suv = CreateObject<UniformRandomVariable>();
       double startJitter = suv->GetValue(0.0, 0.012) + 0.004 * std::max<int>(0, (int)m_senderIndex - 1);
@@ -477,6 +642,7 @@ private:
     hdr.SetGridId (m_g_id);
     hdr.SetRound (m_selectRound);
     hdr.SetDistance (static_cast<float>(DistToGridCenter ()));
+
 
     Ptr<Packet> p = Create<Packet> (16);
     p->AddHeader (hdr);
@@ -574,9 +740,12 @@ private:
   {
     InetSocketAddress bcast (Ipv4Address ("255.255.255.255"), m_port);
     m_socket->SendTo (p, 0, bcast);
+    m_forwardCount++; // BCL: このGWが転送したDATAパケット数をカウント
     NS_LOG_UNCOND ("[" << Simulator::Now ().GetSeconds () << "s] "
                     << m_myAddress << " FWD(DATA) src=" << hdr.GetSrc ()
-                    << " seq=" << hdr.GetSeq ());
+                    << " seq=" << hdr.GetSeq ()
+                    << " fwdCount=" << m_forwardCount
+                    << " (BCL=" << m_bcl << ")");
   }
 
   // ---------- FWDゾーン内判定 ----------
@@ -585,13 +754,77 @@ private:
   {
     if (!s_useGeocast) return true;
     if (!s_zoneComputed) MaybeComputeZone ();
-    if (!s_zoneComputed) return true;
+    if (!s_zoneComputed) return false;
     Ptr<MobilityModel> mm = GetNode ()->GetObject<MobilityModel>(); if (!mm) return true;
     Vector pos = mm->GetPosition ();
+
+    // 共有ゾーンが初期化済みなら N0 共有矩形で判定（全送信ノード共通）
+    if (s_zoneInit) {
+      return (pos.x >= s_fwdRect.x0 && pos.x <= s_fwdRect.x1 &&
+              pos.y >= s_fwdRect.y0 && pos.y <= s_fwdRect.y1);
+    }
+
+    // フォールバック：従来の一時矩形
     return (pos.x >= s_rXmin && pos.x <= s_rXmax &&
             pos.y >= s_rYmin && pos.y <= s_rYmax);
   }
+  
+  // ---------- Add-Forwarding ゾーン内判定 ----------
+  bool IsInsideAddFwdZone () const
+  {
+    if (!s_useGeocast) return false;  // Geocast無効なら追加ゾーンも無効
+    if (!s_zoneComputed) MaybeComputeZone ();
+    if (!s_zoneComputed) return false;
+    EnsureAddFwdComputed ();          // NCN変化時は再計算
 
+    // 共有ゾーンが初期化済みなら N0 共有 ADD-GIDs を使用
+    if (s_zoneInit) {
+      return (s_addFwdGids.find(m_g_id) != s_addFwdGids.end());
+    }
+
+    // フォールバック：従来の追加集合
+    return (s_addZoneGids.find(m_g_id) != s_addZoneGids.end());
+  }
+
+  // ---------- Geocast region 内/隣接グリッド判定 ----------
+  // 7-4: 自身が Geocast region 内かどうか
+  bool IsInsideGeocastRegion () const
+  {
+    if (!s_useGeocast) return false;
+    Ptr<MobilityModel> mm = GetNode ()->GetObject<MobilityModel>(); if (!mm) return false;
+    Vector pos = mm->GetPosition ();
+    return (pos.x >= s_grXmin && pos.x <= s_grXmax &&
+            pos.y >= s_grYmin && pos.y <= s_grYmax);
+  }
+
+  // 7-5 用: 自身の所属グリッドが Geocast region「隣接グリッド」かどうか
+  // （Geocast 矩形をグリッドサイズ分だけ膨らませた矩形と自グリッドが交差し、
+  //   かつ元のGeocast 矩形とは交差しないセルを「隣接グリッド」とみなす）
+  bool IsNeighborOfGeocastRegion () const
+  {
+    if (!s_useGeocast || !s_gridDefined) {
+      // Geocast 無効時は BCL を効かせないため true 扱い
+      return true;
+    }
+    // 自グリッド矩形とGeocast region矩形の交差判定
+    bool intersectsGR =
+      (m_gxmax > s_grXmin && m_gxmin < s_grXmax &&
+       m_gymax > s_grYmin && m_gymin < s_grYmax);
+
+    // グリッド一辺分だけ拡大した矩形との交差判定
+    double exXmin = s_grXmin - s_grid_d;
+    double exXmax = s_grXmax + s_grid_d;
+    double exYmin = s_grYmin - s_grid_d;
+    double exYmax = s_grYmax + s_grid_d;
+
+    bool intersectsExpanded =
+      (m_gxmax > exXmin && m_gxmin < exXmax &&
+       m_gymax > exYmin && m_gymin < exYmax);
+
+    // 元GRには含まれず、拡大矩形とは交差していれば「隣接グリッド」
+    return (intersectsExpanded && !intersectsGR);
+  }
+  
   // --- ユーティリティ: 送信ノードIP→そのg_idを取得（prev==srcのときに使用） ---
   // ※ s_senders に登録された送信ノード配列を走査してIP一致を探す
   static bool FindSenderGidByIp (Ipv4Address ip, uint32_t& outGid)
@@ -611,6 +844,8 @@ private:
     }
     return false;
   }
+  
+  
 
   // ---------- 受信処理 ----------
   // 全メッセージを受信。前ホップIPとヘッダを見て種別ごとに処理。
@@ -628,16 +863,15 @@ private:
       if (p->GetSize () < hdr.GetSerializedSize()) continue;
       p->PeekHeader (hdr);
 
-      // 重複判定キー（既存仕様に合わせ type も混ぜる）
+      // (src,seq,type)で重複排除
       uint64_t key = (static_cast<uint64_t>(hdr.GetSrc().Get()) << 32)
                    | (static_cast<uint64_t>(hdr.GetSeq()) ^ (static_cast<uint64_t>(hdr.GetType()) << 24));
 
-      // ★DATA以外は従来どおり「先に」重複排除する（DATAは後段で条件に応じて登録）
+      // DATA以外は従来どおり「先に」重複排除する（DATAは後段で条件に応じて登録）
       bool isData = (hdr.GetType() == GeoHeader::DATA);
       if (!isData) {
         if (!m_seen.insert (key).second) continue;
       }
-
       switch (hdr.GetType()) {
       case GeoHeader::SELECT: {
         // 同g_id & 非送信のみ候補取り込み
@@ -706,15 +940,19 @@ private:
                         << " prev=" << prevHop
                         << " src="  << hdr.GetSrc ()
                         << " seq="  << hdr.GetSeq ());
+        // 7-1: 自身がゲートウェイノードでなければ転送しない
         if (!m_isGateway) {
           NS_LOG_UNCOND ("[" << Simulator::Now ().GetSeconds () << "s] "
                           << m_myAddress << " DROP not-gateway");
           break;
         }
+        // 7-2: FWDゾーン・Add-FWDゾーンのどちらにも含まれていなければ転送しない
         if (!IsInsideFwdZone ()) {
-          NS_LOG_UNCOND ("[" << Simulator::Now ().GetSeconds () << "s] "
-                          << m_myAddress << " DROP out-of-zone");
-          break;
+          if (!IsInsideAddFwdZone ()) {
+            NS_LOG_UNCOND ("[" << Simulator::Now ().GetSeconds () << "s] "
+                            << m_myAddress << " DROP out-of-zone");
+            break;
+          }
         }
 
         const bool directFromSrc = (prevHop == hdr.GetSrc());
@@ -734,11 +972,42 @@ private:
             // ここでは m_seen に入れない → 後で他GWから届けば一度だけ転送できる
             break;
           }
-          // 同一グリッド → 転送許可（初回のみ）
+          // 7-3: 2回目以降に受信したパケットであれば転送しない（重複判定）
           if (!m_seen.insert (key).second) {
-            // 既に同一(src,seq,type)で転送済み
+            NS_LOG_UNCOND ("[" << Simulator::Now ().GetSeconds () << "s] "
+                            << m_myAddress << " DROP dup-data");
             break;
           }
+          // 7-4: 自身がGeocast region内であれば転送しない
+          if (IsInsideGeocastRegion ()) {
+            NS_LOG_UNCOND ("[" << Simulator::Now ().GetSeconds () << "s] "
+                            << m_myAddress << " DROP inside-geocast-region");
+            break;
+          }
+          // 7-5: 自身がGeocast regionの隣接グリッドかどうかで転送制御
+          bool isNeighbor = IsNeighborOfGeocastRegion ();
+          if (!isNeighbor) {
+            // 隣接グリッドでなければ、BCL による転送回数制限のみ適用
+            if (m_bcl > 0 && m_forwardCount >= m_bcl) {
+              NS_LOG_UNCOND ("[" << Simulator::Now ().GetSeconds () << "s] "
+                              << m_myAddress << " DROP BCL-limit"
+                              << " fwdCount=" << m_forwardCount
+                              << " BCL=" << m_bcl);
+              break;
+            }
+          } else {
+            // 隣接グリッドGW同士では、同じDATAを合計1回だけ中継する
+            uint64_t dataKey =
+              (static_cast<uint64_t>(hdr.GetSrc().Get()) << 32) |
+              static_cast<uint64_t>(hdr.GetSeq());
+            if (!s_neighborDataForwarded.insert (dataKey).second) {
+              NS_LOG_UNCOND ("[" << Simulator::Now ().GetSeconds () << "s] "
+                              << m_myAddress << " DROP neighbor-dup-data");
+              break;
+            }
+          }
+
+          // 7-6: 上記条件に当てはまらなければ転送（ブロードキャスト）
           static Ptr<UniformRandomVariable> uv = CreateObject<UniformRandomVariable>();
           double jitter = uv->GetValue (0.0, 0.006);
           Ptr<Packet> cp = p->Copy();
@@ -748,10 +1017,42 @@ private:
           });
         } else {
           // 他GWからの転送：従来どおり「一度だけ」転送
+          // 7-3: 2回目以降に受信したパケットであれば転送しない（重複判定）
           if (!m_seen.insert (key).second) {
-            // すでに自分が一度処理した(DATA) → 何もしない
+            NS_LOG_UNCOND ("[" << Simulator::Now ().GetSeconds () << "s] "
+                            << m_myAddress << " DROP dup-data");
             break;
           }
+          // 7-4: 自身がGeocast region内であれば転送しない
+          if (IsInsideGeocastRegion ()) {
+            NS_LOG_UNCOND ("[" << Simulator::Now ().GetSeconds () << "s] "
+                            << m_myAddress << " DROP inside-geocast-region");
+            break;
+          }
+          // 7-5: 自身がGeocast regionの隣接グリッドかどうかで転送制御
+          bool isNeighbor = IsNeighborOfGeocastRegion ();
+          if (!isNeighbor) {
+            // 隣接グリッドでなければ、BCL による転送回数制限のみ適用
+            if (m_bcl > 0 && m_forwardCount >= m_bcl) {
+              NS_LOG_UNCOND ("[" << Simulator::Now ().GetSeconds () << "s] "
+                              << m_myAddress << " DROP BCL-limit"
+                              << " fwdCount=" << m_forwardCount
+                              << " BCL=" << m_bcl);
+              break;
+            }
+          } else {
+            // 隣接グリッドGW同士では、同じDATAを合計1回だけ中継する
+            uint64_t dataKey =
+              (static_cast<uint64_t>(hdr.GetSrc().Get()) << 32) |
+              static_cast<uint64_t>(hdr.GetSeq());
+            if (!s_neighborDataForwarded.insert (dataKey).second) {
+              NS_LOG_UNCOND ("[" << Simulator::Now ().GetSeconds () << "s] "
+                              << m_myAddress << " DROP neighbor-dup-data");
+              break;
+            }
+          }
+
+          // 7-6: 上記条件に当てはまらなければ転送（ブロードキャスト）
           static Ptr<UniformRandomVariable> uv = CreateObject<UniformRandomVariable>();
           double jitter = uv->GetValue (0.0, 0.006);
           Ptr<Packet> cp = p->Copy();
@@ -766,6 +1067,7 @@ private:
       }
     }
   }
+
 
 private:
   // --- インスタンス状態 ---
@@ -797,6 +1099,9 @@ private:
   double m_grXmin{0.0}, m_grYmin{0.0};
   double m_grXmax{0.0}, m_grYmax{0.0};
   uint32_t m_s_id{1};
+  uint32_t m_ncn{0};          // NCN
+  uint32_t m_bcl{0};          // BCL: ゲートウェイごとの転送制限数(0なら制限なし)
+  uint32_t m_forwardCount{0}; // BCL: このGWが今までに転送したDATAパケット数
 
   // グリッド越え検知（CourseChange + 50ms ポーリング）
   EventId m_gridCheckEvent;
@@ -816,10 +1121,23 @@ private:
   // 共有（FWDゾーン）
   static bool   s_useGeocast;
   static bool   s_zoneComputed;
-  static double s_grXmin, s_grYmin, s_grXmax, s_grYmax;
+  static double s_grXmin, s_grYmin, s_grYmax, s_grXmax;
   static uint32_t s_s_id;
   static double s_rXmin, s_rYmin, s_rXmax, s_rYmax;
   static std::vector< Ptr<Node> > s_senders;
+  static uint32_t s_NCN;
+  static uint32_t s_srcGridId;
+  static std::set<uint32_t> s_addZoneGids;
+  static uint32_t s_addFwdComputedForNCN; // Add-FWD: 再計算版
+
+  // ★ 共有ゾーン（N0が一度だけ確定し、全送信ノードで共有）
+  struct Rect { double x0, y0, x1, y1; };
+  static bool s_zoneInit;                       // 共有ゾーン初期化済み
+  static Rect s_fwdRect;                        // 共有Forwarding矩形
+  static std::unordered_set<uint32_t> s_addFwdGids; // 共有ADD-FWD GIDs
+  static Ipv4Address s_primarySrc;              // 参考用（未使用でも保持）
+  // 隣接グリッドGW全体で「既に中継したDATA(src,seq)」を共有する集合（7-5用）
+  static std::set<uint64_t> s_neighborDataForwarded;
 
   // 共有（グリッド境界）
   static bool   s_gridDefined;
@@ -836,9 +1154,23 @@ bool   SimpleFloodingApp::s_zoneComputed = false;
 double SimpleFloodingApp::s_grXmin = 0.0, SimpleFloodingApp::s_grYmin = 0.0;
 double SimpleFloodingApp::s_grXmax = 0.0, SimpleFloodingApp::s_grYmax = 0.0;
 uint32_t SimpleFloodingApp::s_s_id = 1;
+
+bool SimpleFloodingApp::s_zoneInit = false;  // ★ 共有ゾーンの初期化フラグ
+SimpleFloodingApp::Rect SimpleFloodingApp::s_fwdRect {0,0,0,0}; // ★ 共有FWD矩形
+std::unordered_set<uint32_t> SimpleFloodingApp::s_addFwdGids;   // ★ 共有ADD-GIDs
+Ipv4Address SimpleFloodingApp::s_primarySrc = Ipv4Address("0.0.0.0"); // ★ 参考保持
+
+uint32_t SimpleFloodingApp::s_NCN = 0;            // Add-Forwarding: NCN初期値
+uint32_t SimpleFloodingApp::s_srcGridId = 0;      // Add-Forwarding: 送信元g_id
+std::set<uint32_t> SimpleFloodingApp::s_addZoneGids; // Add-Forwarding: 追加g_id集合
+uint32_t SimpleFloodingApp::s_addFwdComputedForNCN = std::numeric_limits<uint32_t>::max(); // Add-FWD: 未計算を示す
+
 double SimpleFloodingApp::s_rXmin = 0.0, SimpleFloodingApp::s_rYmin = 0.0;
 double SimpleFloodingApp::s_rXmax = 0.0, SimpleFloodingApp::s_rYmax = 0.0;
 std::vector< Ptr<Node> > SimpleFloodingApp::s_senders;
+
+// 隣接グリッドGWで共有する中継済みDATA集合
+std::set<uint64_t> SimpleFloodingApp::s_neighborDataForwarded;
 
 // グリッド境界テーブル
 bool   SimpleFloodingApp::s_gridDefined = false;
@@ -872,18 +1204,20 @@ static std::vector<Vector> ParseSrcCoords (const std::string& s)
 int main (int argc, char *argv[])
 {
   uint32_t nNodes   = 0;
-  double   stopTime = 60.0;   // 実行時間
+  double   stopTime = 2.0;   // 実行時間
   double   interval = 1.0;    // 送信ノード送信周期
   uint32_t nSources = 1;      // 送信ノード数
   uint32_t srcId    = 1;      // FWDゾーンの基準送信ノードID
   std::string srcCoordsStr = "";
+  uint32_t NCN = 0;           // NCN
+  uint32_t BCL = 0;           // BCL: ゲートウェイの転送制限数(0=制限なし)
 
   bool   useGeocast = false;  // FWDゾーンを使うか
   double grXmin = 0.0, grYmin = 0.0, grXmax = 0.0, grYmax = 0.0;
 
   // ランダム配置パラメータ（非送信ノードの数と矩形領域）
-  uint32_t nodeCount = 400;                // 送信以外のノード数
-  double nodeXmin = -50.0, nodeYmin = -50.0, nodeXmax = 350.0, nodeYmax = 350.0;
+  uint32_t nodeCount = 8;                // 送信以外のノード数
+  double nodeXmin = -50.0, nodeYmin = -50.0, nodeXmax = 50.0, nodeYmax = 50.0;
 
   // --- CLI 引数の定義と読み込み ---
   CommandLine cmd(__FILE__);
@@ -904,6 +1238,9 @@ int main (int argc, char *argv[])
   cmd.AddValue ("nodeYmin",  "Random placement Ymin", nodeYmin);
   cmd.AddValue ("nodeXmax",  "Random placement Xmax", nodeXmax);
   cmd.AddValue ("nodeYmax",  "Random placement Ymax", nodeYmax);
+  
+  cmd.AddValue ("NCN",       "Number of coded packets (controls Add-Forwarding zone)", NCN); // Add-Forwarding: 受け取り
+  cmd.AddValue ("BCL",       "Forwarding limit per gateway node (0 = no limit)", BCL);       // BCL: CLIから転送制限数を指定
 
   cmd.Parse (argc, argv);
 
@@ -957,8 +1294,8 @@ int main (int argc, char *argv[])
     mobSrc.SetMobilityModel ("ns3::ConstantPositionMobilityModel");
     mobSrc.Install (srcNodes);
   }
-  
-  // /*
+ 
+  /*
   // --- 非送信ノード：RandomWaypoint（矩形内を移動） ---
   // ※ 速度は今は 5.0 m/s。4km/h にしたい場合は 1.111111 に変更
   {
@@ -984,16 +1321,16 @@ int main (int argc, char *argv[])
                                "PositionAllocator", PointerValue (randAlloc));
     mobOther.Install (otherNodes);
   }
-  // */
+  */
   
   
-  /*
-  // --- 非送信ノード：格子状に固定配置（デバッグ用） ---
+   //  /*
+    // --- 非送信ノード：格子状に固定配置（デバッグ用） ---
   {
     const uint32_t N = otherNodes.GetN();
 
-    const double startX = 25.0;  // 格子の起点X
-    const double startY = 25.0;  // 格子の起点Y
+    const double startX = -25.0;  // 格子の起点X
+    const double startY = -25.0;  // 格子の起点Y
     const double pitch  = 50.0;  // x・y 共通の格子間隔（m）
 
     // ほぼ正方に並べるための列数（必要なら固定列数にしてもOK）
@@ -1016,7 +1353,8 @@ int main (int argc, char *argv[])
     mobOther.SetMobilityModel("ns3::ConstantPositionMobilityModel");
     mobOther.Install(otherNodes);
   }
-  */
+ // */
+  
 
   // --- IP スタック / アドレス割当（/22） ---
   InternetStackHelper internet; internet.Install (nodes);
@@ -1035,7 +1373,7 @@ int main (int argc, char *argv[])
     uint32_t id = srcNodes.Get (i)->GetId (); anim.UpdateNodeColor (id, 255, 80, 80);
   }
 
-  // --- アプリ配備：送信ノード（Start=1.0s, 小ジッタ後にDATA開始） ---
+  // --- アプリ配備：送信ノード（Start=1.0s, 即DATA開始） ---
   for (uint32_t i = 0; i < srcNodes.GetN (); ++i) {
     Ptr<SimpleFloodingApp> app = CreateObject<SimpleFloodingApp>();
     app->SetAttribute ("SendInterval", TimeValue (Seconds (interval)));
@@ -1046,6 +1384,8 @@ int main (int argc, char *argv[])
     app->SetAttribute ("grYmin", DoubleValue (grYmin));
     app->SetAttribute ("grXmax", DoubleValue (grXmax));
     app->SetAttribute ("grYmax", DoubleValue (grYmax));
+    app->SetAttribute ("NCN",   UintegerValue (NCN));
+    app->SetAttribute ("BCL",   UintegerValue (BCL));   // BCL: 送信ノード側にも同じ制限値を配布
     app->SetAttribute ("S_id",   UintegerValue (srcId));
     srcNodes.Get (i)->AddApplication (app);
     app->SetStartTime (Seconds (1.0));
@@ -1062,6 +1402,8 @@ int main (int argc, char *argv[])
     app->SetAttribute ("grYmin", DoubleValue (grYmin));
     app->SetAttribute ("grXmax", DoubleValue (grXmax));
     app->SetAttribute ("grYmax", DoubleValue (grYmax));
+    app->SetAttribute ("NCN",   UintegerValue (NCN));
+    app->SetAttribute ("BCL",   UintegerValue (BCL));   // BCL: 非送信ノード(GW候補)にも制限値を配布
     app->SetAttribute ("S_id",   UintegerValue (srcId));
     otherNodes.Get (i)->AddApplication (app);
     app->SetStartTime (Seconds (0.0001));
